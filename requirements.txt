@@ -1,4 +1,2 @@
-pandas
-openpyxl
+# Optional dependency for higher-quality market/dividend data
 pykrx
-requests
