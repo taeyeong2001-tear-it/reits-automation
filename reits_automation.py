@@ -7,17 +7,16 @@ import argparse
 import io
 import os
 import re
+import sys
 import zipfile
-from dataclasses import dataclass
+from dataclasses import dataclass, asdict
 from datetime import datetime
-from typing import Optional
+from typing import Any, Optional
+from xml.etree import ElementTree as ET
 
-import pandas as pd
-import requests
-from bs4 import BeautifulSoup
-from pykrx import stock
 
 DART_BASE = "https://opendart.fss.or.kr/api"
+DEFAULT_REPORT_BEGIN_DATE = "20200101"
 
 ASSET_TYPE_PATTERNS = {
     "오피스": ["오피스", "office"],
@@ -57,7 +56,27 @@ class ReitRecord:
     note: str = ""
 
 
+def require_module(module_name: str):
+    try:
+        return __import__(module_name)
+    except ModuleNotFoundError as exc:
+        raise RuntimeError(
+            f"필수 패키지 '{module_name}'가 설치되어 있지 않습니다. "
+            "`pip install -r requirements.txt`를 먼저 실행하세요."
+        ) from exc
+
+
+def create_session():
+    requests = require_module("requests")
+    session = requests.Session()
+    adapter = requests.adapters.HTTPAdapter(max_retries=3)
+    session.mount("http://", adapter)
+    session.mount("https://", adapter)
+    return session
+
+
 def get_listed_reits(base_date: str) -> list[tuple[str, str]]:
+    stock = require_module("pykrx").stock
     tickers = stock.get_market_ticker_list(base_date, market="ALL")
     reits = []
     for ticker in tickers:
@@ -68,9 +87,12 @@ def get_listed_reits(base_date: str) -> list[tuple[str, str]]:
 
 
 def get_dividend_yields(base_date: str) -> dict[str, float]:
+    pd = require_module("pandas")
+    stock = require_module("pykrx").stock
     fundamentals = stock.get_market_fundamental_by_ticker(base_date, market="ALL")
     if "DIV" not in fundamentals.columns:
         return {}
+
     result: dict[str, float] = {}
     for ticker, row in fundamentals.iterrows():
         div = row.get("DIV")
@@ -79,24 +101,34 @@ def get_dividend_yields(base_date: str) -> dict[str, float]:
     return result
 
 
-def get_corp_code_mapping(api_key: str) -> dict[str, str]:
-    resp = requests.get(f"{DART_BASE}/corpCode.xml", params={"crtfc_key": api_key}, timeout=30)
+def _xml_first_text(node: ET.Element, tag: str) -> str:
+    found = node.find(tag)
+    return (found.text or "").strip() if found is not None else ""
+
+
+def get_corp_code_mapping(api_key: str, session) -> dict[str, str]:
+    resp = session.get(f"{DART_BASE}/corpCode.xml", params={"crtfc_key": api_key}, timeout=30)
     resp.raise_for_status()
 
     with zipfile.ZipFile(io.BytesIO(resp.content)) as zf:
         with zf.open("CORPCODE.xml") as fp:
-            soup = BeautifulSoup(fp.read(), "xml")
+            root = ET.fromstring(fp.read())
 
-    mapping = {}
-    for item in soup.find_all("list"):
-        stock_code = (item.find_text("stock_code") or "").strip()
-        corp_code = (item.find_text("corp_code") or "").strip()
+    mapping: dict[str, str] = {}
+    for item in root.findall("list"):
+        stock_code = _xml_first_text(item, "stock_code")
+        corp_code = _xml_first_text(item, "corp_code")
         if stock_code and corp_code:
             mapping[stock_code] = corp_code
     return mapping
 
 
-def find_latest_report_receipt(api_key: str, corp_code: str, begin_date: str) -> Optional[str]:
+def find_latest_report_receipt(
+    api_key: str,
+    corp_code: str,
+    begin_date: str,
+    session,
+) -> Optional[str]:
     params = {
         "crtfc_key": api_key,
         "corp_code": corp_code,
@@ -105,7 +137,7 @@ def find_latest_report_receipt(api_key: str, corp_code: str, begin_date: str) ->
         "last_reprt_at": "Y",
         "page_count": 10,
     }
-    resp = requests.get(f"{DART_BASE}/list.json", params=params, timeout=30)
+    resp = session.get(f"{DART_BASE}/list.json", params=params, timeout=30)
     resp.raise_for_status()
     data = resp.json()
 
@@ -116,8 +148,8 @@ def find_latest_report_receipt(api_key: str, corp_code: str, begin_date: str) ->
     return reports[0].get("rcept_no")
 
 
-def download_report_text(api_key: str, rcept_no: str) -> str:
-    resp = requests.get(
+def download_report_text(api_key: str, rcept_no: str, session) -> str:
+    resp = session.get(
         f"{DART_BASE}/document.xml",
         params={"crtfc_key": api_key, "rcept_no": rcept_no},
         timeout=60,
@@ -125,12 +157,17 @@ def download_report_text(api_key: str, rcept_no: str) -> str:
     resp.raise_for_status()
 
     with zipfile.ZipFile(io.BytesIO(resp.content)) as zf:
-        xml_names = [n for n in zf.namelist() if n.lower().endswith(".xml")]
+        xml_names = [name for name in zf.namelist() if name.lower().endswith(".xml")]
         texts = []
-        for name in xml_names[:5]:
+        for name in xml_names:
             with zf.open(name) as fp:
-                soup = BeautifulSoup(fp.read(), "xml")
-                texts.append(soup.get_text(" ", strip=True))
+                try:
+                    root = ET.fromstring(fp.read())
+                except ET.ParseError:
+                    continue
+                text = " ".join(root.itertext())
+                if text.strip():
+                    texts.append(text.strip())
         return "\n".join(texts)
 
 
@@ -138,13 +175,11 @@ def infer_asset_type(text: str) -> Optional[str]:
     lower = text.lower()
     found = []
     for category, patterns in ASSET_TYPE_PATTERNS.items():
-        if any(p.lower() in lower for p in patterns):
+        if any(pattern.lower() in lower for pattern in patterns):
             found.append(category)
 
     if not found:
         return None
-    if len(found) == 1:
-        return found[0]
     return ", ".join(sorted(set(found)))
 
 
@@ -170,32 +205,37 @@ def infer_vacancy_rate(text: str) -> Optional[float]:
     return min(values)
 
 
-def build_dataset(base_date: str, dart_api_key: Optional[str]) -> pd.DataFrame:
+def build_dataset(base_date: str, dart_api_key: Optional[str]) -> Any:
+    pd = require_module("pandas")
     reits = get_listed_reits(base_date)
     dividends = get_dividend_yields(base_date)
 
     records: list[ReitRecord] = []
 
     corp_map: dict[str, str] = {}
+    session = create_session()
     if dart_api_key:
-        corp_map = get_corp_code_mapping(dart_api_key)
+        corp_map = get_corp_code_mapping(dart_api_key, session)
 
     for ticker, name in reits:
-        record = ReitRecord(
-            ticker=ticker,
-            name=name,
-            dividend_yield=dividends.get(ticker),
-        )
+        record = ReitRecord(ticker=ticker, name=name, dividend_yield=dividends.get(ticker))
 
         if dart_api_key and ticker in corp_map:
             try:
-                rcept_no = find_latest_report_receipt(dart_api_key, corp_map[ticker], "20200101")
+                rcept_no = find_latest_report_receipt(
+                    dart_api_key,
+                    corp_map[ticker],
+                    DEFAULT_REPORT_BEGIN_DATE,
+                    session,
+                )
                 if rcept_no:
-                    text = download_report_text(dart_api_key, rcept_no)
+                    text = download_report_text(dart_api_key, rcept_no, session)
                     record.asset_type = infer_asset_type(text)
                     record.lease_structure = infer_lease_structure(text)
                     record.vacancy_rate = infer_vacancy_rate(text)
                     record.source = f"DART:{rcept_no}"
+                    if not any([record.asset_type, record.lease_structure, record.vacancy_rate]):
+                        record.note = "보고서 파싱 성공, 주요 지표 미추출"
                 else:
                     record.note = "DART 보고서 없음"
             except Exception as exc:  # noqa: BLE001
@@ -205,8 +245,17 @@ def build_dataset(base_date: str, dart_api_key: Optional[str]) -> pd.DataFrame:
 
         records.append(record)
 
-    df = pd.DataFrame([r.__dict__ for r in records])
-    df = df.rename(
+    ordered_columns = [
+        "종목코드",
+        "리츠명",
+        "자산 유형(추정)",
+        "임차 구조(추정)",
+        "공실률(%)",
+        "배당 수익률(%)",
+        "데이터 출처",
+        "비고",
+    ]
+    df = pd.DataFrame([asdict(record) for record in records]).rename(
         columns={
             "ticker": "종목코드",
             "name": "리츠명",
@@ -218,10 +267,10 @@ def build_dataset(base_date: str, dart_api_key: Optional[str]) -> pd.DataFrame:
             "note": "비고",
         }
     )
-    return df
+    return df.reindex(columns=ordered_columns)
 
 
-def main() -> None:
+def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="대한민국 상장 리츠 자동 수집기")
     parser.add_argument("--date", default=datetime.today().strftime("%Y%m%d"), help="기준일(YYYYMMDD)")
     parser.add_argument("--output", default="korea_listed_reits.xlsx", help="출력 엑셀 파일 경로")
@@ -230,13 +279,22 @@ def main() -> None:
         default=os.getenv("OPEN_DART_API_KEY"),
         help="OpenDART API Key (미지정시 배당 수익률/종목정보 위주로 생성)",
     )
-    args = parser.parse_args()
+    return parser.parse_args()
 
-    df = build_dataset(args.date, args.dart_api_key)
-    df.to_excel(args.output, index=False)
+
+def main() -> int:
+    args = parse_args()
+
+    try:
+        df = build_dataset(args.date, args.dart_api_key)
+        df.to_excel(args.output, index=False)
+    except RuntimeError as exc:
+        print(f"[실패] {exc}", file=sys.stderr)
+        return 2
 
     print(f"총 {len(df)}개 리츠를 {args.output}로 저장했습니다.")
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

@@ -47,6 +47,12 @@ python reits_automation.py --dart-api-key YOUR_API_KEY
 - **KRX (pykrx)**: 상장 리츠 목록(종목명 `리츠` 포함), 배당 수익률
 - **OpenDART API(선택)**: 최근 사업보고서 텍스트를 파싱해 자산 유형/임차 구조/공실률 추정
 
+## 개선된 동작
+
+- `--help`는 의존성 설치 전에도 정상 동작합니다.
+- 필수 패키지가 누락되면 `pip install -r requirements.txt` 안내 메시지를 출력하고 종료합니다.
+- OpenDART XML 파싱을 표준 라이브러리로 처리해 불필요한 의존성을 줄였습니다.
+
 ## 주의사항
 
 - `자산 유형/임차 구조/공실률`은 보고서 내 텍스트 키워드 기반 자동 추정치입니다.
