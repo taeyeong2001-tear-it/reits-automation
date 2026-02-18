@@ -257,6 +257,22 @@ def infer_asset_type(text: str) -> Optional[str]:
     return ", ".join(sorted(set(found))) if found else None
 
 
+
+
+def infer_asset_type_from_name(name: str) -> Optional[str]:
+    """리츠명 기반의 간단 추정(공시 미사용 시 빈값 완화)."""
+    lower = name.lower()
+    mapping = {
+        "물류": ["esr", "물류", "켄달", "logis", "로지"],
+        "리테일": ["롯데", "신한서부티엔디", "알파", "리테일", "유통"],
+        "오피스": ["오피스", "더원", "글로벌"],
+        "주거": ["레지던스", "주거"],
+        "호텔/숙박": ["호텔", "숙박"],
+        "인프라": ["인프라"],
+    }
+    found = [k for k, pats in mapping.items() if any(p in lower for p in pats)]
+    return ", ".join(sorted(set(found))) if found else None
+
 def infer_lease_structure(text: str) -> Optional[str]:
     found = [kw for kw in LEASE_STRUCTURE_PATTERNS if kw.lower() in text.lower()]
     return ", ".join(sorted(set(found))) if found else None
@@ -275,7 +291,7 @@ def infer_vacancy_rate(text: str) -> Optional[float]:
     return min(values) if values else None
 
 
-def build_dataset(base_date: str, dart_api_key: Optional[str]) -> tuple[list[ReitRecord], str]:
+def build_dataset(base_date: str, dart_api_key: Optional[str]) -> tuple[list[ReitRecord], str, int]:
     reits, source_name = get_listed_reits(base_date)
     dividends = get_dividend_yields(base_date)
 
@@ -287,8 +303,10 @@ def build_dataset(base_date: str, dart_api_key: Optional[str]) -> tuple[list[Rei
             print(f"[경고] DART 기업코드 수집 실패: {exc}")
 
     records: list[ReitRecord] = []
+    unmapped_count = 0
     for ticker, name in reits:
         rec = ReitRecord(ticker=ticker, name=name, dividend_yield=dividends.get(ticker), source=source_name)
+        rec.asset_type = infer_asset_type_from_name(name)
 
         if dart_api_key and ticker in corp_map:
             try:
@@ -304,11 +322,11 @@ def build_dataset(base_date: str, dart_api_key: Optional[str]) -> tuple[list[Rei
             except Exception as exc:
                 rec.note = f"DART 수집 실패: {exc}"
         elif dart_api_key:
-            rec.note = "DART 종목 매핑 없음"
+            unmapped_count += 1
 
         records.append(rec)
 
-    return records, source_name
+    return records, source_name, unmapped_count
 
 
 def _col_to_letter(idx: int) -> str:
@@ -433,8 +451,11 @@ def main() -> int:
     if not args.dart_api_key:
         print("[안내] OPEN_DART_API_KEY가 없어 DART 기반 컬럼은 비어 있을 수 있습니다.")
 
-    records, src = build_dataset(args.date, args.dart_api_key)
+    records, src, unmapped_count = build_dataset(args.date, args.dart_api_key)
     write_xlsx(records, args.output)
+
+    if args.dart_api_key and unmapped_count:
+        print(f"[안내] DART 종목 매핑 누락: {unmapped_count}개 (행별 비고에는 반복 표기하지 않음)")
 
     print(f"총 {len(records)}개 리츠를 {args.output}로 저장했습니다. (종목 소스: {src})")
     return 0
